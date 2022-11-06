@@ -2,7 +2,7 @@
 Slot machine game written in C# with a console interface by Sathariel.
 # Rules
 
-You get a winning combination in this slot by matching symbols to form a line from the reels on the machine. This slot machine game requires you to match at least three consecutive images from left to right to get a winning combination, but some demand you get five or more.  
+You get a winning combination in this slot by matching symbols to form a line from the reels on the machine. This slot machine game requires you to match at least three consecutive symbols to get a winning combination, but some demand you get five or more.  
 
 To get an idea of how you can win when gambling at this game, you can see some examples below:
 
@@ -22,7 +22,7 @@ If you get Five identical symbols on all of the reels this is called Jackpot. Wh
 
 # Payouts
 
-Payouts are based on the matched symbol and it's multiplier and its count on a reel.
+Payouts are based on the matched symbol, it's multiplier and its count on a reel.
 
 # Winning Table
 
@@ -32,11 +32,13 @@ A - (4 matched on a single line) = 10x your bet * times matched.
 
 A - (5 matched on a single line) = 10x your bet * times matched * 10;
 
+
 K - (3 matched on a single line) = 3x your bet.
 
 K - (4 matched on a single line) = 3x your bet * times matched.
 
 K - (5 matched on a single line) = 3x your bet * times matched * 10;
+
 
 ♥ - (3 matched on a single line) = 2.5x your bet.
 
@@ -44,11 +46,13 @@ K - (5 matched on a single line) = 3x your bet * times matched * 10;
 
 ♥ - (5 matched on a single line) = 2.5x your bet * times matched * 10;
 
+
 ♦ - (3 matched on a single line) = 1.3x your bet.
 
 ♦ - (4 matched on a single line) = 1.3x your bet * times matched.
 
 ♦ - (5 matched on a single line) = 1.3x your bet * times matched * 10;
+
 
 ♣ - (3 matched on a single line) = 0.7x your bet.
 
