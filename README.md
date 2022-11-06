@@ -20,33 +20,47 @@ If you get Five identical symbols on all of the reels this is called Jackpot. Wh
 
 💜💜♠💔💔 – Two symbols in a line (you will need a minimum of three)
 
-# Payout
-Payout are based on the matched symbol and it's multiplier and its count on a reel.
+# Payouts
+
+Payouts are based on the matched symbol and it's multiplier and its count on a reel.
 
 # Winning Table
 
 A - (3 matched on a single line) = 10x your bet.
+
 A - (4 matched on a single line) = 10x your bet * times matched.
+
 A - (5 matched on a single line) = 10x your bet * times matched * 10;
 
 K - (3 matched on a single line) = 3x your bet.
+
 K - (4 matched on a single line) = 3x your bet * times matched.
+
 K - (5 matched on a single line) = 3x your bet * times matched * 10;
 
 ♥ - (3 matched on a single line) = 2.5x your bet.
+
 ♥ - (4 matched on a single line) = 2.5x your bet * times matched.
+
 ♥ - (5 matched on a single line) = 2.5x your bet * times matched * 10;
 
 ♦ - (3 matched on a single line) = 1.3x your bet.
+
 ♦ - (4 matched on a single line) = 1.3x your bet * times matched.
+
 ♦ - (5 matched on a single line) = 1.3x your bet * times matched * 10;
 
 ♣ - (3 matched on a single line) = 0.7x your bet.
+
 ♣ - (4 matched on a single line) = 0.7x your bet * times matched.
+
 ♣ - (5 matched on a single line) = 0.7x your bet * times matched * 10;
 
-#Commands
+# Commands
+
 There are several commands that you can use to interact with the game.
 
+
 addBalance - Adds additional $20 to player's account.
+
 generateSlot [betAmount] - Generates slot reels based on a bet amount.
