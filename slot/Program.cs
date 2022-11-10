@@ -5,6 +5,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Threading;
 using System.Text.RegularExpressions;
+using System.Linq.Expressions;
 
 namespace slot
 {
@@ -25,7 +26,7 @@ namespace slot
                         player.UpdateBalance(20.00);
                         Console.WriteLine(player.ToString());
                         break;
-
+                   
                 }
                 if (command.StartsWith("generateSlot"))
                 {

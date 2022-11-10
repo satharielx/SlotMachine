@@ -117,19 +117,28 @@ namespace slot
                             }
                         
                     }
-                   
+                    
 
+                }
+                Dictionary<char, List<int>> diagonals = MatchDiagonals(slot);
+                Dictionary<int, double> diagsWins = new Dictionary<int, double>();
+                Dictionary<char, List<int>> diagsRepetitive = new Dictionary<char, List<int>>();
+                foreach (var item in diagonals)
+                {
+                    
+                    diagsRepetitive[item.Key] = new List<int> { item.Value[0], item.Value[1] };
+                    diagsWins[item.Value[0]] = (WinningTable[item.Key] * betAmount) * item.Value[0] * 40;
                 }
 
                 //If there are no winnings
-                if (!(winningTable.Count > 0))
+                if (!(winningTable.Count > 0) && !(diagsWins.Count > 0))
                 {
                     Program.PrintLine("No winnings, Try Again.");
                     player.UpdateBalance(-betAmount);
                     Program.PrintLine(player.ToString());
                 }
                 //If there is any win, printing out information.
-                else {
+                else if(winningTable.Count > 0) {
                     Program.PrintLine("");
                     Program.PrintLine(new string(' ', 49) + new string('*', 20));
                     Program.PrintLine(new string(' ', 53) + "W I N N E R   ");
@@ -137,15 +146,78 @@ namespace slot
                     Program.PrintLine("");
                     foreach (var rep in repetitive)
                     {
-                        Program.PrintLine($"Won ${winningTable[rep.Value[0]]} at line {rep.Value[0]} by symbol {rep.Key} repeated {rep.Value[1]} times");
+                        Program.PrintLine($"Won ${winningTable[rep.Value[0]]} " +
+                            $"at line {rep.Value[0]} " +
+                            $"by symbol {rep.Key} " +
+                            $"repeated {rep.Value[1]} times");
                         player.UpdateBalance(winningTable[rep.Value[0]]);
-                        Program.PrintLine($"Updated Balance: ${player.Balance}");
+                        
+                    }
+                    foreach (var rep in diagsRepetitive)
+                    {
+                        Program.PrintLine($"Won ${diagsWins[rep.Value[0]]} " +
+                            $"at line {rep.Value[0]} " +
+                            $"by symbol {rep.Key} " +
+                            $"repeated {rep.Value[1]} times");
+                        player.UpdateBalance(diagsWins[rep.Value[0]]);
+
                     }
                 }
             }  
         }
-        
-        
+
+        private Dictionary<char, List<int>> MatchDiagonals(SlotReels slot) {
+            string[] slotReels = new string[] { };
+            Dictionary<char, List<int>> result = new Dictionary<char, List<int>>();
+            for (int i = 0; i < slot.Reels.Length; i++)
+            {
+                SlotReel current = slot.Reels[i];
+                string slotReel = AsString(current);
+                Array.Resize(ref slotReels, slotReels.Length + 1);
+                slotReels[slotReels.Length - 1] = slotReel;
+            }
+            
+            //Match first diagonal
+            string firstDiag = "";
+            for (int i = 0; i < slotReels.Length; i++)
+            {
+                firstDiag += slotReels[i][i * 2];
+            }
+            //Match second diagonal
+            string secondDiag = "";
+            for (int i = 0; i < slotReels.Length; i++)
+            {
+                string line = slotReels[i];
+                if (i == slotReels.Length - 1)
+                {
+                    secondDiag += slotReels[i][4 / (i + 1) - 1];
+                }
+                else
+                    secondDiag += slotReels[i][4 / (i + 1)];
+            }
+            string pattern = @"(.)\1{2,}";
+            Regex engine = new Regex(pattern);
+            Match found = engine.Match(firstDiag);
+            char sym = firstDiag[0];
+            if (found.Success)
+            {
+                result[sym] = new List<int> { 4, firstDiag.Count(x => sym == x) };
+            }
+            
+            found = engine.Match(secondDiag);
+            if (found.Success) {
+                result[sym] = new List<int> { 5, secondDiag.Count(x => sym == x) };
+            }
+            return result;
+        }
+        public string AsString(SlotReel reel) {
+            string final = "";
+            for (int i = 0; i < reel.items.Length; i++) { 
+                SlotItem currentItem = reel.items[i];
+                final += currentItem.type;
+            }
+            return final;
+        }
         public void PrintSlotSpin(SlotReels slot) {
             for (int i = 0; i < slot.Reels.Length; i++) {
                 Console.WriteLine();
