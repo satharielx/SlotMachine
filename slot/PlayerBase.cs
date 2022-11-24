@@ -36,6 +36,7 @@ namespace slot
         public void UpdateBalance(double amount) {
            
             Balance += amount;
+            previous = Balance;
             HashKeyStroke = Balance.ToKeychain<double>();
         }
         public void SetBalance(double amount)
@@ -54,7 +55,9 @@ namespace slot
                 temp = Balance.ToKeychain<double>();
                 if (temp.hash != HashKeyStroke.hash)
                 {
-                    Program.PrintLine($"[*] Anti Cheat Measures: A violation was detected. Previous value was set.");
+                    GCHandle gch = GCHandle.Alloc(Balance, GCHandleType.Pinned);
+                    IntPtr pObj = gch.AddrOfPinnedObject();
+                    Program.PrintLine($"[*] SAC: A violation at address 0x{pObj.ToString("X4")} was detected. Previous value was set.");
                     SetBalance(previous);
                     Program.PrintLine(this.ToString());
                 }

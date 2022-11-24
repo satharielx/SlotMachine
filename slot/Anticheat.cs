@@ -10,6 +10,7 @@ using System.Security.Cryptography;
 using System.Security.AccessControl;
 using Microsoft.SqlServer.Server;
 using System.Threading;
+using System.Diagnostics;
 
 namespace slot
 {
@@ -33,6 +34,8 @@ namespace slot
         public Anticheat()
         {
             Program.PrintLine("Anti Cheat developed by Sathariel, loaded successfully!");
+            AddProcedure("DebuggerCheck", new Thread(DebuggerWatch));
+
         }
         public void AddProcedure(string procedureName, Thread threaded) {
             if (!procedures.ContainsKey(procedureName))
@@ -58,6 +61,21 @@ namespace slot
             }
             Program.PrintLine(new string('*', 12));
         }
+        protected void DebuggerWatch() {
+            bool onceDetected = false;
+            while (true) {
+                Process[] processes = Process.GetProcesses();
+                Process result = null;
+                for (int i = 0; i < processes.Length; i++) {
+                    if (processes[i].ProcessName.Contains("cheatengine")) result = processes[i];
+                }
+                if (result != null) {
+                    Program.PrintLine($"[*] SAC: Process with name {result.ProcessName} with handle {result.Handle.ToString("X2")} and base address of 0x{result.MainModule.BaseAddress.ToString("X2")} is intefering with the app.");
+                }
+                
+                Thread.Sleep(10000);
+            }
+        }
     }
     
     static class Misc {
@@ -78,11 +96,14 @@ namespace slot
                 Array.Reverse(code);
             SHA256Managed engine = new SHA256Managed();
             byte[] result = engine.ComputeHash(code, 0, code.Length);
+            
             AnticheatTypes.Keychain ret = new AnticheatTypes.Keychain();
             ret.raw = result;
             ret.hash = ret.AsString();
             return ret;
         }
+
+        
         
     }
 }
