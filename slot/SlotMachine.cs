@@ -51,7 +51,7 @@ namespace slot
         PlayerBase player;
         public List<char> SlotSymbols = new List<char>()
         {
-            'A', 'K', '♥', '♦', '♣', 'W'
+            'A', 'K', '3', '4', '5', 'W'
         };
         public Dictionary<char, double> WinningTable = new Dictionary<char, double>();
         public double RDP { get; set; }
@@ -61,9 +61,9 @@ namespace slot
             WinningTable['W'] = 11.0;
             WinningTable['A'] = 10.0;
             WinningTable['K'] = 3.0;
-            WinningTable['♥'] = 2.5;
-            WinningTable['♦'] = 1.3;
-            WinningTable['♣'] = 0.7;
+            WinningTable['3'] = 2.5;
+            WinningTable['4'] = 1.3;
+            WinningTable['5'] = 0.7;
             this.player = player;
         }
         public SlotReels GenerateSpin() {
@@ -339,7 +339,7 @@ namespace slot
                 Console.Write(new string(' ', 45));
                 for (int j = 0; j < slot.Reels[i].items.Length; j++) {
                     SlotItem slotItem = slot.Reels[i].items[j];
-                    Console.Write(slotItem.type + "     ");
+                    Console.Write(slotItem.type + "  ");
                 }
                 Console.WriteLine();
                 Console.WriteLine();
@@ -394,7 +394,7 @@ namespace slot
         }
         private char GetRandomChar() {
             char result = '0';
-            string valid = "AK♥♦♣W";
+            string valid = "AK345W";
             result = valid[new Random().Next(0, valid.Length - 1)];
             return result;
         }

@@ -14,6 +14,7 @@ using System.Diagnostics;
 
 namespace slot
 {
+
     public static class AnticheatTypes
     {
         public struct Keychain
@@ -30,12 +31,20 @@ namespace slot
         }
     }
     public class Anticheat {
+        [DllImport("kernel32.dll", SetLastError = true, ExactSpelling = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CheckRemoteDebuggerPresent(IntPtr hProcess, [MarshalAs(UnmanagedType.Bool)] out bool isDebuggerPresent);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsDebuggerPresent();
+
         private Dictionary<string, Thread> procedures = new Dictionary<string, Thread>();
         public Anticheat()
         {
             Program.PrintLine("Anti Cheat developed by Sathariel, loaded successfully!");
-            AddProcedure("DebuggerCheck", new Thread(DebuggerWatch));
-
+            Thread dbgWatch = new Thread(DebuggerWatch);
+            AddProcedure("debugger", dbgWatch);
         }
         public void AddProcedure(string procedureName, Thread threaded) {
             if (!procedures.ContainsKey(procedureName))
@@ -61,19 +70,21 @@ namespace slot
             }
             Program.PrintLine(new string('*', 12));
         }
+        protected bool IsDebuggerAttached()
+        {
+            return CheckRemoteDebuggerPresent(Process.GetCurrentProcess().Handle, out bool isDebuggerPresent);
+        }
         protected void DebuggerWatch() {
             bool onceDetected = false;
             while (true) {
-                Process[] processes = Process.GetProcesses();
-                Process result = null;
-                for (int i = 0; i < processes.Length; i++) {
-                    if (processes[i].ProcessName.Contains("cheatengine")) result = processes[i];
+                if(IsDebuggerAttached())
+                {
+                    
+                    Program.PrintLine($"[*] SAC: Debugger detected. ");
+                    
                 }
-                if (result != null) {
-                    Program.PrintLine($"[*] SAC: Process with name {result.ProcessName} with handle {result.Handle.ToString("X2")} and base address of 0x{result.MainModule.BaseAddress.ToString("X2")} is intefering with the app.");
-                }
-                
-                Thread.Sleep(10000);
+
+                Thread.Sleep(1000);
             }
         }
     }
