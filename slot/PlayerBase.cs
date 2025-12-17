@@ -1,220 +1,151 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Security.Cryptography;
 using System.Runtime.InteropServices;
 using System.Threading;
-using System.Net;
 
 namespace slot
 {
     public class PlayerBase
     {
-        private IntPtr balanceMemory;
-        private double previous = 0.0;
-        private double current = 0.0;
-        private AnticheatTypes.Keychain previosKey = new AnticheatTypes.Keychain();
-        private Anticheat anticheat = new Anticheat();
-        private AnticheatTypes.Keychain HashKeyStroke;
-        private bool changingBalance = false;
-         
+        private const int BALANCE_OFFSET = 0;
+        private const int GUARD_OFFSET = 8;
+        private const int KEY_OFFSET = 16;
 
-        public string Username { get; private set; }
+        private const int PROTECTED_SIZE = 4096;
+        private static readonly Random Rng = new Random();
+
+        private static IntPtr memory = IntPtr.Zero;
+        private static readonly object sync = new object();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr VirtualAlloc(IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool VirtualProtect(IntPtr lpAddress, uint dwSize, uint flNewProtect, out uint lpflOldProtect);
+
+        private const uint MEM_COMMIT = 0x1000;
+        private const uint MEM_RESERVE = 0x2000;
+        private const uint PAGE_READWRITE = 0x04;
+        private const uint PAGE_NOACCESS = 0x01;
 
         public PlayerBase()
         {
-            
-            AllocateMemory();
-            HashKeyStroke = Balance.ToKeychain<double>();
-            Thread antiCheating = new Thread(OnChange);
-            anticheat.AddProcedure("BalanceCheck", antiCheating);
+            Anticheat.Start();
+            Allocate();
+        }
+
+        public static void ApplyPunishment()
+        {
+            lock (sync)
+            {
+                SetTrueBalance(0.0);
+                Anticheat.Log($"[PUNISHMENT APPLIED] Balance reset to 0.0 by integrity failure.");
+            }
+        }
+
+        private static double GetTrueBalance()
+        {
+            AllowRead();
+
+            long obfuscatedBalance = Marshal.ReadInt64(memory, BALANCE_OFFSET);
+            long obfuscatedGuard = Marshal.ReadInt64(memory, GUARD_OFFSET);
+            long currentKey = Marshal.ReadInt64(memory, KEY_OFFSET);
+
+            ReArmTrap();
+
+            long decryptedLong = obfuscatedBalance ^ currentKey;
+            long decryptedGuard = obfuscatedGuard ^ currentKey;
+
+            if (decryptedLong + currentKey != decryptedGuard)
+            {
+                Anticheat.Log("[CRITICAL TAMPER] SSOT integrity check failed! Protected memory was changed externally.");
+                ApplyPunishment();
+                return 0.0;
+            }
+
+            return BitConverter.Int64BitsToDouble(decryptedLong);
+        }
+
+        private static void SetTrueBalance(double value)
+        {
+            long newKey = (long)Rng.NextDouble() * long.MaxValue;
+            long longValue = BitConverter.DoubleToInt64Bits(value);
+
+            long obfuscatedBalance = longValue ^ newKey;
+            long guardValue = longValue + newKey;
+            long obfuscatedGuard = guardValue ^ newKey;
+
+            AllowWrite();
+            Marshal.WriteInt64(memory, BALANCE_OFFSET, obfuscatedBalance);
+            Marshal.WriteInt64(memory, GUARD_OFFSET, obfuscatedGuard);
+            Marshal.WriteInt64(memory, KEY_OFFSET, newKey);
+            ReArmTrap();
         }
 
         public double Balance
         {
             get
             {
-                return
-                     GetBalance();
+                lock (sync)
+                {
+                    return GetTrueBalance();
+                }
             }
-
         }
 
-        private double GetBalance() {
-            if (balanceMemory == IntPtr.Zero)
+        public void Add(double amount)
+        {
+            lock (sync)
             {
-                
-                AllocateMemory();
-                return Marshal.PtrToStructure<double>(balanceMemory);
+                double currentBalance = GetTrueBalance();
+                currentBalance += amount;
+                SetTrueBalance(currentBalance);
             }
-            else return Marshal.PtrToStructure<double>(balanceMemory);
         }
 
-        private void AllocateMemory()
+        public void Set(double value)
         {
-            if (balanceMemory == IntPtr.Zero)
+            lock (sync)
             {
-                balanceMemory = Marshal.AllocHGlobal(Marshal.SizeOf<double>());
-                Marshal.StructureToPtr(current, balanceMemory, false);
-                previous = Marshal.PtrToStructure<double>(balanceMemory);
-                if (VirtualProtect(balanceMemory, (UIntPtr)Marshal.SizeOf<double>(), MemoryProtection.Readonly, out _))
-                {
-
-                    Program.PrintLine($"[*] SAC: Memory protected successfully!");
-                    IsMemoryProtected();
-                }
-                else {
-                    Marshal.GetLastWin32Error();
-                }
-                
+                SetTrueBalance(value);
             }
-            
         }
 
-        public void IsMemoryProtected() {
-            MEMORY_BASIC_INFORMATION mbi;
-
-            if (VirtualQuery(balanceMemory, out mbi, (uint)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION))))
-
+        private static void Allocate()
+        {
+            if (memory == IntPtr.Zero)
             {
+                memory = VirtualAlloc(IntPtr.Zero, PROTECTED_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-                if (mbi.Protect == 0x04)
+                if (memory == IntPtr.Zero)
+                    throw new Exception("Failed to allocate protected memory page.");
 
-                {
-
-                    Console.WriteLine("MEMORY CHECK PASSED! BALANCE VARIABLE IS PROTECTED!");
-
-                }
-
-                else
-
-                {
-
-                    Console.WriteLine("MEMORY CHECK PASSED! BALANCE VARIABLE IS NOT PROTECTED!");
-
-                }
-
+                SetTrueBalance(1000.0);
             }
         }
 
-        public void PrintProcedures() => anticheat.ShowAllProcedures();
+        public static IntPtr GetProtectedBase() => memory;
+        public static uint GetProtectedSize() => PROTECTED_SIZE;
 
-        public void UpdateBalance(double amount)
+        public static bool IsProtectedAddress(IntPtr addr)
         {
-            changingBalance = true;
-            VirtualProtect(balanceMemory, (UIntPtr)Marshal.SizeOf<double>(), MemoryProtection.ReadWrite, out _);
-            Thread.Sleep(1000);
-            double old = GetBalance();
-            previous = old;
-            current += old + amount;
-            
-            Marshal.StructureToPtr(current, balanceMemory, false);
-            HashKeyStroke = Balance.ToKeychain<double>();
-            
-            changingBalance = false;
-            current = 0.0;
-            VirtualProtect(balanceMemory, (UIntPtr)Marshal.SizeOf<double>(), MemoryProtection.Readonly, out _);
+            if (memory == IntPtr.Zero) return false;
+
+            long pageStart = memory.ToInt64();
+            long pageEnd = pageStart + PROTECTED_SIZE;
+            long fault = addr.ToInt64();
+
+            return fault >= pageStart && fault < pageEnd;
         }
 
-        public void SetBalance(double amount)
+        public static void ReArmTrap()
         {
-            VirtualProtect(balanceMemory, (UIntPtr)Marshal.SizeOf<double>(), MemoryProtection.ReadWrite, out _);
-            Thread.Sleep(1000);
-            double old = GetBalance();
-            previous = old;
-            current = amount;
-
-            Marshal.StructureToPtr(current, balanceMemory, false);
-            HashKeyStroke = Balance.ToKeychain<double>();
-            old = GetBalance();
-            previous = old;
-            changingBalance = false;
-            current = 0.0;
-            VirtualProtect(balanceMemory, (UIntPtr)Marshal.SizeOf<double>(), MemoryProtection.Readonly, out _);
-        }
-
-        public override string ToString()
-        {
-            return $"Player has ${Balance} in their account.\nHash key of value: {HashKeyStroke.hash}";
-        }
-
-        private void OnChange()
-        {
-            while (true)
+            if (memory != IntPtr.Zero)
             {
-                
-                if (balanceMemory == IntPtr.Zero)
-                {
-                    Program.PrintLine($"[*] SAC: Error - Invalid memory pointer.");
-                    Marshal.FreeHGlobal(balanceMemory);
-                    return;
-                }
-
-                double temp = Marshal.PtrToStructure<double>(balanceMemory);
-                AnticheatTypes.Keychain tempKey = temp.ToKeychain<double>();
-
-                if (HashKeyStroke.hash != tempKey.hash)
-                {
-                   
-                        Program.PrintLine($"[*] SAC: A change in address ({balanceMemory.ToInt64():X2}) balance value detected. Previous value was set.");
-                        SetBalance(0.0);
-                        Program.PrintLine(this.ToString());
-                    
-                    
-                }
-
-                Thread.Sleep(1000);
+                VirtualProtect(memory, PROTECTED_SIZE, PAGE_NOACCESS, out _);
             }
         }
 
-        [DllImport("kernel32.dll")]
-
-        static extern bool VirtualQuery(IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, uint dwLength);
-
-
-        [DllImport("kernel32.dll")]
-
-        static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, MemoryProtection flNewProtect, out uint lpflOldProtect);
-
-
-        [StructLayout(LayoutKind.Sequential)]
-
-        struct MEMORY_BASIC_INFORMATION
-
-        {
-
-            public IntPtr BaseAddress;
-
-            public IntPtr AllocationBase;
-
-            public uint AllocationProtect;
-
-            public uint RegionSize;
-
-            public uint State;
-
-            public uint Protect;
-
-            public uint Type;
-
-        }
-
-        [Flags]
-        private enum MemoryProtection : uint
-        {
-            NoAccess = 0x01,
-            Readonly = 0x04,  
-            ReadWrite = 0x08, 
-            ExecuteRead = 0x20,
-            ExecuteReadWrite = 0x40
-        }
-
-        ~PlayerBase()
-        {
-            Marshal.FreeHGlobal(balanceMemory);
-        }
+        private static void AllowRead() => VirtualProtect(memory, PROTECTED_SIZE, PAGE_READWRITE, out _);
+        private static void AllowWrite() => VirtualProtect(memory, PROTECTED_SIZE, PAGE_READWRITE, out _);
     }
 }
-

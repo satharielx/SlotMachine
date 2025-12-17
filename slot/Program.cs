@@ -23,7 +23,7 @@ namespace slot
             MediaPlayer mp = new MediaPlayer();
             mp.Open(new Uri(Directory.GetCurrentDirectory() + @"\sounds\soundtrack.wav"));
             mp.Play();
-            player.PrintProcedures();
+            //player.PrintProcedures();
             string command = "";
 
             while ((command = Console.ReadLine()) != "END")
@@ -31,8 +31,8 @@ namespace slot
                 switch (command)
                 {
                     case "addBalance":
-                        player.UpdateBalance(20.00);
-                        Console.WriteLine(player.ToString());
+                        player.Add(20.00);
+                        Console.WriteLine($"Player has ${player.Balance} in their account.");
                         break;
                     case "animationTest":
                         slot.AnimateRoll(10);
@@ -59,9 +59,12 @@ namespace slot
                                 Clear();
                                 slot.PrintSlotSpin(generated);
                                 Program.PrintLine($"{new string(' ', 21)}Bet amount: ${betAmount};     Balance Available: ${player.Balance}      Coin Value: ${betAmount / 5} for each line.");
-                                Program.PrintLine($"{new string(' ', 21)}Reels checksum: {generated.ToKeychain<SlotReels>().AsString()}");
+                                //Program.PrintLine($"{new string(' ', 21)}Reels checksum: {generated.ToKeychain<SlotReels>().AsString()}");
                                 slot.CalculateWins(generated, betAmount);
                                 Program.PrintLine($"Total Balance after winnings: ${player.Balance}");
+
+                                // Offer the player to purchase free spins after the spin
+                                try { slot.OfferPurchaseFreeSpins(betAmount); } catch { }
                             }
                             else PrintLine("Insufficent balance!");
                         }
@@ -76,9 +79,12 @@ namespace slot
                             Clear();
                             slot.PrintSlotSpin(generated);
                             Program.PrintLine($"{new string(' ', 21)}Bet amount: ${betAmount};     Balance Available: ${player.Balance}      Coin Value: ${betAmount / 5} for each line.");
-                            Program.PrintLine($"{new string(' ', 21)}Reels checksum: {generated.ToKeychain<SlotReels>().AsString()}");
+                            //Program.PrintLine($"{new string(' ', 21)}Reels checksum: {generated.ToKeychain<SlotReels>().AsString()}");
                             slot.CalculateWins(generated, double.Parse(arguments[1]));
                             Program.PrintLine($"Total Balance after winnings: ${player.Balance}");
+
+                            // Offer the player to purchase free spins after the spin
+                            try { slot.OfferPurchaseFreeSpins(betAmount); } catch { }
                         }
                         else PrintLine("Insufficent balance!");
                     }

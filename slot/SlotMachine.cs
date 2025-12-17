@@ -1,413 +1,578 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
-using System.Xml.XPath;
-using System.Threading;
 using System.Text.RegularExpressions;
-using Microsoft.Win32;
-using System.Security.Principal;
-using System.CodeDom;
-using System.Diagnostics.Eventing.Reader;
+using System.Threading;
 using System.Windows.Media;
 using System.IO;
 
 namespace slot
 {
+    // Lightweight representations for reel and item. Kept as structs for value semantics
+    // but designed with simple, clear APIs to make the calling code more readable.
+    public struct SlotItem
+    {
+        public int Index { get; set; }
+        public char Type { get; set; }
+    }
+
     public struct SlotReel
     {
-       public SlotItem[] items;
-       public int lenght;
-        public SlotReel() {
-            items = new SlotItem[] { };
-            lenght = 0;
+        private List<SlotItem> _items;
+        public IReadOnlyList<SlotItem> Items => _items ??= new List<SlotItem>();
+        public int Length => Items.Count;
+
+        public SlotReel(IEnumerable<SlotItem> items)
+        {
+            _items = items?.ToList() ?? new List<SlotItem>();
+        }
+
+        public void Add(SlotItem item)
+        {
+            if (_items == null) _items = new List<SlotItem>();
+            _items.Add(item);
         }
     }
-    public struct SlotItem {
-        public int index;
-        public char type;
-    }
+
     public struct SlotReels
     {
-        public SlotReel[] Reels;
-        public int lenght;
-        public SlotReels()
+        private List<SlotReel> _reels;
+        public IReadOnlyList<SlotReel> Reels => _reels ??= new List<SlotReel>();
+        public int Length => Reels.Count;
+
+        public void Add(SlotReel reel)
         {
-            Reels = new SlotReel[] { };
-            lenght = 0;
+            if (_reels == null) _reels = new List<SlotReel>();
+            _reels.Add(reel);
         }
     }
-    public struct Vector2 {
-        public int x = 0;
-        public int y = 0;
-        public Vector2(int x, int y) {
-            this.x = x;
-            this.y = y;
-        } 
-    }
+
     public class SlotMachine
     {
-        PlayerBase player;
-        public List<char> SlotSymbols = new List<char>()
-        {
-            'A', 'K', '3', '4', '5', 'W'
-        };
-        public Dictionary<char, double> WinningTable = new Dictionary<char, double>();
+        private readonly PlayerBase _player;
+        private static readonly ThreadLocal<Random> Rng = new ThreadLocal<Random>(() => new Random());
+
+        // Symbols and payout table are explicit and immutable after construction
+        // We keep explicit W (wild) and S (scatter) semantics; baseSymbols excludes those.
+        public IReadOnlyList<char> SlotSymbols { get; } = new List<char> { 'A', 'K', '3', '4', '5', 'S', 'W' };
+        private IReadOnlyList<char> BaseSymbols => SlotSymbols.Where(c => c != 'W' && c != 'S').ToList();
+        public IReadOnlyDictionary<char, double> WinningTable { get; }
+
+        // Free spins state exposed so the game loop can react accordingly
+        public int FreeSpins { get; private set; }
+
+        // Free-spins specific multiplier (stacks during the bonus game). Only active while in free-spin mode.
+        public int FreeSpinMultiplier { get; private set; } = 1;
+        private const int MaxFreeSpinMultiplier = 10;
+        private bool IsInFreeSpinMode { get; set; } = false;
+        // Column index (0-based) where the multiplier indicator is shown. -1 = none.
+        private int MultiplierColumnIndex { get; set; } = -1;
+
         public double RDP { get; set; }
         public int Lines { get; set; }
+
         public SlotMachine(PlayerBase player)
         {
-            WinningTable['W'] = 11.0;
-            WinningTable['A'] = 10.0;
-            WinningTable['K'] = 3.0;
-            WinningTable['3'] = 2.5;
-            WinningTable['4'] = 1.3;
-            WinningTable['5'] = 0.7;
-            this.player = player;
+            _player = player ?? throw new ArgumentNullException(nameof(player));
+            WinningTable = new Dictionary<char, double>
+            {
+                ['W'] = 11.0,
+                ['A'] = 10.0,
+                ['K'] = 3.0,
+                ['3'] = 2.5,
+                ['4'] = 1.3,
+                ['5'] = 0.7
+            };
         }
-        public SlotReels GenerateSpin() {
-            int rows = 3;
-            int cols = 5;
-            Dictionary<int, List<int>> wildsPlaces = new Dictionary<int, List<int>>();
-            double percentToGetWild = 0.0114;
-            SlotReels result = new SlotReels();
-            for (int i = 0; i < rows; i++) {
-                SlotReel slotRow = new SlotReel();
-                wildsPlaces[i] = new List<int>();
-                for (int j = 0; j < cols; j++) {
 
-                    bool shouldHaveWild = new Random().NextDouble() <= percentToGetWild;
-                    SlotItem slotItem = new SlotItem();
-                    slotItem.index = j;
-                    
-                    slotItem.type = shouldHaveWild ? SlotSymbols[SlotSymbols.Count - 1] : SlotSymbols[new Random().Next(SlotSymbols.Count - 1)];
-                    if (shouldHaveWild) wildsPlaces[i].Add(j);
-                    Array.Resize(ref slotRow.items, slotRow.items.Length + 1);
-                    slotRow.items[slotRow.items.Length - 1] = slotItem;
-                    slotRow.lenght++;
-                    Thread.Sleep(100);
+        // Generate a spin in row-major order (rows x columns). Uses a single RNG source
+        // and avoids Thread.Sleep to be fast and deterministic in tests.
+        public SlotReels GenerateSpin()
+        {
+            const int rows = 3;
+            const int cols = 5;
+            var wildsPlaces = new Dictionary<int, List<int>>();
+            const double percentToGetWild = 0.0114; // small chance for wild
+            const double percentToGetScatter = 0.015; // small chance for scatter
+
+            var result = new SlotReels();
+
+            for (int r = 0; r < rows; r++)
+            {
+                var row = new SlotReel();
+                wildsPlaces[r] = new List<int>();
+
+                for (int c = 0; c < cols; c++)
+                {
+                    bool isWild = Rng.Value.NextDouble() <= percentToGetWild;
+                    bool isScatter = !isWild && Rng.Value.NextDouble() <= percentToGetScatter;
+
+                    var item = new SlotItem
+                    {
+                        Index = c,
+                        Type = isWild ? 'W' : isScatter ? 'S' : BaseSymbols[Rng.Value.Next(0, BaseSymbols.Count)]
+                    };
+
+                    if (isWild) wildsPlaces[r].Add(c);
+                    row.Add(item);
                 }
-                Array.Resize(ref result.Reels, result.Reels.Length + 1);
-                result.Reels[result.Reels.Length - 1] = slotRow;
-                 
+
+                result.Add(row);
             }
-            result = IssueWilds(wildsPlaces, result);
-            return result;
-        }
-        private SlotReels IssueWilds(Dictionary<int, List<int>> wildsPlaces, SlotReels slotRoll) {
 
-            if (wildsPlaces.Count() > 0) { 
-                List<int> placesToReplace = new List<int>();
-                foreach (var wild in wildsPlaces) {
-                    var temp = wild.Value;
-                    for (int i = 0; i < slotRoll.Reels.Length; i++) {
-                        for (int j = 0; j < temp.Count(); j++) {
-                            slotRoll.Reels[i].items[temp[j]].type = 'W';
-                        }
-                    }
+            return IssueWilds(wildsPlaces, result);
+        }
+
+        // Apply wilds to the generated matrix. The wildsPlaces map is keyed by row index
+        // and contains column indices that should be replaced with the WILD symbol.
+        private SlotReels IssueWilds(Dictionary<int, List<int>> wildsPlaces, SlotReels slotRoll)
+        {
+            if (wildsPlaces == null || wildsPlaces.Count == 0) return slotRoll;
+
+            foreach (var kv in wildsPlaces)
+            {
+                int rowIdx = kv.Key;
+                if (rowIdx < 0 || rowIdx >= slotRoll.Length) continue;
+
+                var cols = kv.Value;
+                for (int i = 0; i < cols.Count; i++)
+                {
+                    int colIdx = cols[i];
+                    if (colIdx < 0 || colIdx >= slotRoll.Reels[rowIdx].Length) continue;
+
+                    var reel = slotRoll.Reels[rowIdx];
+                    var items = reel.Items.ToList();
+                    var si = items[colIdx];
+                    si.Type = 'W';
+                    items[colIdx] = si;
+
+                    var updatedReel = new SlotReel(items);
+                    var newReels = slotRoll.Reels.ToList();
+                    newReels[rowIdx] = updatedReel;
+
+                    var newSlotRoll = new SlotReels();
+                    foreach (var r in newReels) newSlotRoll.Add(r);
+                    slotRoll = newSlotRoll;
                 }
-            } 
+            }
+
             return slotRoll;
         }
-        public bool CoinflipResult() { return new Random().Next(0, 1) == 1; }
-        public int FlipResult(int min, int max) { return new Random().Next(min, max); }
-        #region Win Logic
-        public void CalculateWins(SlotReels slot, double betAmount)
+
+        // Award free spins to the player; this is intentionally simple so the caller controls
+        // how and when free spins are consumed in the main game loop.
+        public void AwardFreeSpins(int count)
         {
-            Dictionary<int, double> winningTable = new Dictionary<int, double>();
-            Dictionary<int, KeyValuePair<int, char>> repetitive = new Dictionary<int, KeyValuePair<int, char>>();
-            #region Three Horizontal Lines Logic
-            if (slot.Reels.Length >= 3)
+            if (count <= 0) return;
+            FreeSpins += count;
+            Program.PrintLine($"Awarded {count} Free Spins! Total Free Spins: {FreeSpins}");
+            try
             {
-                for (int i = 0; i < slot.Reels.Count(); i++)
-                {
-                    SlotReel slotRow = slot.Reels[i];
-
-                    string pattern = @"(.)\1{2,}";
-                    Regex engine = new Regex(pattern);
-                    string line = "";
-                    int lineNumber = i + 1;
-                    for (int j = 0; j < slotRow.items.Length; j++)
-                    {
-                        line += slotRow.items[j].type;
-                    }
-                    Match match = engine.Match(line);
-                    //If a candidate meets the conditions of the pattern above eg. (We have winning condition)
-                    if (match.Success)
-                    {
-                        char repeated = match.Value[0];
-                        int timesRepeated = line.Count(x => repeated == x);
-                        //timesRepeated == 2 && 
-                        if (timesRepeated == 3)
-                        {
-                            repetitive[lineNumber] = new KeyValuePair<int, char>(timesRepeated, repeated);
-                            winningTable[lineNumber] = WinningTable[repeated] * (betAmount / 5);
-                        }
-                        else if (timesRepeated == 4)
-                        {
-                            repetitive[lineNumber] = new KeyValuePair<int, char>(timesRepeated, repeated);
-                            winningTable[lineNumber] = (WinningTable[repeated] * (betAmount / 5)) * timesRepeated;
-                        }
-                        else if (timesRepeated == 5)
-                        {
-                            repetitive[lineNumber] = new KeyValuePair<int, char>(timesRepeated, repeated);
-                            winningTable[lineNumber] = (WinningTable[repeated] * (betAmount / 5)) * timesRepeated * 10;
-                        }
-
-                    }
-                }
-                #endregion
-                #region Diagonals Wins
-                Dictionary<char, List<int>> diagonals = MatchDiagonals(slot);
-                Dictionary<int, double> diagsWins = new Dictionary<int, double>();
-                Dictionary<char, List<int>> diagsRepetitive = new Dictionary<char, List<int>>();
-                foreach (var item in diagonals)
-                {
-
-                    diagsRepetitive[item.Key] = new List<int> { item.Value[0], item.Value[1] };
-                    diagsWins[item.Value[0]] = (WinningTable[item.Key] * (betAmount / 5)) * item.Value[0] * 11;
-                }
-                #endregion
-                #region Vertical Wins
-                Dictionary<int, char> verticals = MatchVertical(slot);
-                Dictionary<int, double> vertWins = new Dictionary<int, double>();
-                Dictionary<int, char> vertRepetitive = new Dictionary<int, char>();
-                foreach (var item in verticals) {
-                    vertRepetitive[item.Key] = item.Value;
-                    vertWins[item.Key] = (WinningTable[item.Value] * (betAmount / 5)) * 3 * 20;
-                }
-                #endregion
-                #region No Wins
-                //If there are no winnings
-                if (!(winningTable.Count > 0) && !(diagsWins.Count > 0) && !(vertWins.Count > 0))
-                {
-                    Program.PrintLine("No winnings, Try Again.");
-                    player.UpdateBalance(-betAmount);
-                    Program.PrintLine(player.ToString());
-                }
-                #endregion
-                #region Wins
-                //If there is any win, printing out information.
-                else if (winningTable.Count > 0 || diagsWins.Count > 0 || vertWins.Count > 0)
-                {
-                    List<double> winsTotal = new List<double>();
-                    Program.PrintLine("");
-                    Program.PrintLine(new string(' ', 49) + new string('*', 20));
-                    Program.PrintLine(new string(' ', 53) + "W I N N E R   ");
-                    Program.PrintLine(new string(' ', 49) + new string('*', 20));
-                    Program.PrintLine("");
-                    player.UpdateBalance(-betAmount);
-                    
-                    foreach (var rep in repetitive)
-                    {
-                        winsTotal.Add(winningTable[rep.Key]);
-                        Program.PrintLine($"Won ${winningTable[rep.Key]} " +
-                            $"at line {rep.Key} " +
-                            $"by symbol {rep.Value.Value} " +
-                            $"repeated {rep.Value.Key} times");
-                        player.UpdateBalance(winningTable[rep.Key]);
-
-                    }
-                    foreach (var rep in diagsRepetitive)
-                    {
-                        winsTotal.Add(diagsWins[rep.Value[0]]);
-                        Program.PrintLine($"Won ${diagsWins[rep.Value[0]]} " +
-                            $"at line {rep.Value[0]} " +
-                            $"by symbol {rep.Key} " +
-                            $"repeated {rep.Value[1]} times");
-                        player.UpdateBalance(diagsWins[rep.Value[0]]);
-
-                    }
-                    foreach (var rep in vertRepetitive) {
-                        winsTotal.Add(vertWins[rep.Key]);
-                        Program.PrintLine($"Won ${vertWins[rep.Key]} " +
-                           $"at vertical line {rep.Key} " +
-                           $"by symbol " + (rep.Value == 'W' ? "special triggered bonus from WILD symbol" : rep.Value) +
-                           $" repeated {3} times");
-                        player.UpdateBalance(vertWins[rep.Key]);
-                    }
-                    Program.PrintLine($"Total win is ${winsTotal.Sum()} with a bet amount of ${betAmount}");
-                    if (winsTotal.Sum() > 500)
-                    {
-                        MediaPlayer mp = new MediaPlayer();
-                        mp.Open(new Uri(Directory.GetCurrentDirectory() + @"\sounds\bigwin.wav"));
-                        mp.Play();
-                        mp.Volume = 0.6;
-                        Thread.Sleep(5000);
-                        mp.Stop();
-                    }
-                    else {
-                        MediaPlayer mp = new MediaPlayer();
-                        mp.Open(new Uri(Directory.GetCurrentDirectory() + @"\sounds\win.wav"));
-                        mp.Play();
-                        mp.Volume = 0.4;
-                    }
-                    #endregion
-                }
+                var mp = new MediaPlayer();
+                mp.Open(new Uri(Path.Combine(Directory.GetCurrentDirectory(), "sounds", "freespin.wav")));
+                mp.Volume = 0.5;
+                mp.Play();
+                Thread.Sleep(1200);
+                mp.Stop();
             }
+            catch { }
         }
-        #region Diagonals Logic
-        private Dictionary<char, List<int>> MatchDiagonals(SlotReels slot) {
-            string[] slotReels = new string[] { };
-            Dictionary<char, List<int>> result = new Dictionary<char, List<int>>();
-            for (int i = 0; i < slot.Reels.Length; i++)
-            {
-                SlotReel current = slot.Reels[i];
-                string slotReel = AsString(current);
-                Array.Resize(ref slotReels, slotReels.Length + 1);
-                slotReels[slotReels.Length - 1] = slotReel;
-            }
-            
-            //Match first diagonal
 
-            string firstDiag = "";
-            for (int i = 0; i < slotReels.Length; i++)
+        // Start and consume free spins. Free spins run automatically but suppress the
+        // interactive free-spin prompt to avoid nested prompts during the bonus game.
+        // Multiplier stacks during the free-spins session based on WILD occurrences.
+        public void PlayFreeSpins(int spins, double betAmount)
+        {
+            if (spins <= 0 || FreeSpins <= 0) return;
+
+            int toPlay = Math.Min(spins, FreeSpins);
+            Program.PrintLine($"Starting {toPlay} Free Spins...");
+
+            // initialize free-spin mode and multiplier
+            IsInFreeSpinMode = true;
+            FreeSpinMultiplier = 1;
+            MultiplierColumnIndex = -1;
+
+            while (toPlay > 0 && FreeSpins > 0)
             {
-                firstDiag += slotReels[i][i * 2];
-            }
-            //Match second diagonal
-            string secondDiag = "";
-            for (int i = 0; i < slotReels.Length; i++)
-            {
-                string line = slotReels[i];
-                if (i == slotReels.Length - 1)
+                var generated = GenerateSpin();
+                AnimateRoll(2);
+                ClearConsoleAndPrintSpin(generated, betAmount);
+
+                // Determine wild positions before applying payouts so the current multiplier applies
+                const int cols = 5;
+                var wildColumns = new List<int>();
+                for (int c = 0; c < cols; c++)
                 {
-                    secondDiag += slotReels[i][4 / (i + 1) - 1];
+                    if (generated.Reels.Any(r => c < r.Length && r.Items[c].Type == 'W'))
+                        wildColumns.Add(c);
+                }
+                int wildCount = wildColumns.Count;
+
+                // If there are wilds, pick the first column to display the multiplier indicator
+                if (wildColumns.Count > 0)
+                    MultiplierColumnIndex = wildColumns[0];
+
+                // Apply wins with the current multiplier
+                CalculateWins(generated, betAmount, promptForFreeSpins: false, multiplier: FreeSpinMultiplier);
+
+                // After applying wins, increase multiplier by the number of wilds (stacking), capped
+                if (wildCount > 0)
+                {
+                    FreeSpinMultiplier = Math.Min(MaxFreeSpinMultiplier, FreeSpinMultiplier + wildCount);
+                    Program.PrintLine($"Free spin multiplier increased to x{FreeSpinMultiplier}!");
+                }
+
+                FreeSpins--;
+                toPlay--;
+            }
+
+            IsInFreeSpinMode = false;
+            MultiplierColumnIndex = -1;
+            Program.PrintLine($"Free Spins complete. Remaining Free Spins: {FreeSpins}");
+        }
+
+        private void ClearConsoleAndPrintSpin(SlotReels generated, double betAmount)
+        {
+            Program.Clear();
+            PrintSlotSpin(generated);
+            if (IsInFreeSpinMode)
+                Program.PrintLine($"{new string(' ', 21)}Bet amount: ${betAmount};     Balance Available: ${_player.Balance}      Coin Value: ${betAmount / 5} for each line.    FreeSpin Multiplier: x{FreeSpinMultiplier}");
+            else
+                Program.PrintLine($"{new string(' ', 21)}Bet amount: ${betAmount};     Balance Available: ${_player.Balance}      Coin Value: ${betAmount / 5} for each line.");
+        }
+
+        // Offer the player to buy free spins after a normal spin. The price is derived
+        // from the current bet amount to keep the offer proportional to the stake.
+        // This method is idempotent (will not award if player refuses or lacks funds).
+        public void OfferPurchaseFreeSpins(double betAmount, int count = 10)
+        {
+            if (count <= 0) return;
+            if (FreeSpins > 0) return; // don't offer if player already has free spins
+
+            double price = Math.Round(Math.Max(1.0, betAmount) * 10.0, 2); // 10x the bet as the purchase price
+
+            Program.PrintLine($"Would you like to buy {count} Free Spins for ${price}? (Y/N)");
+            var resp = Console.ReadLine();
+            if (string.IsNullOrEmpty(resp)) return;
+
+            if (resp.Equals("Y", StringComparison.OrdinalIgnoreCase) || resp.Equals("Yes", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_player.Balance < price)
+                {
+                    Program.PrintLine("Insufficient balance to purchase Free Spins.");
+                    return;
+                }
+
+                _player.Add(-price);
+                AwardFreeSpins(count);
+
+                Program.PrintLine($"Free Spins purchased for ${price}. Start now? (Y/N)");
+                var startResp = Console.ReadLine();
+                if (!string.IsNullOrEmpty(startResp) && (startResp.Equals("Y", StringComparison.OrdinalIgnoreCase) || startResp.Equals("Yes", StringComparison.OrdinalIgnoreCase)))
+                {
+                    PlayFreeSpins(count, betAmount);
                 }
                 else
-                    secondDiag += slotReels[i][4 / (i + 1)];
+                {
+                    Program.PrintLine("Free Spins saved. You can start them later with the appropriate command.");
+                }
             }
-            string pattern = @"(.)\1{2,}";
-            Regex engine = new Regex(pattern);
-            Match found = engine.Match(firstDiag);
-            char sym = firstDiag[0];
-            if (found.Success)
-            {
-                result[sym] = new List<int> { 4, firstDiag.Count(x => sym == x) };
-            }
-            
-            found = engine.Match(secondDiag);
-            if (found.Success) {
-                result[sym] = new List<int> { 5, secondDiag.Count(x => sym == x) };
-            }
-            return result;
         }
-        #endregion
-        #region Match Vertices
-        public Dictionary<int, char> MatchVertical(SlotReels slot) {
-            Dictionary<int, char> result = new Dictionary<int, char>();
-            //Verticals Match
-            int columnsCount = 0;
-            
-                for (int j = 0; j < slot.Reels[0].items.Length; j++) {
-                    columnsCount++;
-                }
-            int line = 0;
-            for (int i = 0; i < columnsCount; i++) {
-                string verticalRow = "";
-                line = i + 1;
-                for (int j = 0; j < slot.Reels.Count(); j++) {
-                   verticalRow += slot.Reels[j].items[i].type;
-                    
-                }
-                string pattern = @"(.)\1{2,}";
-                Regex engine = new Regex(pattern);
-                Match match = engine.Match(verticalRow);
+
+        // Simple coinflip and bounded random helper using our thread-local RNG
+        public bool CoinflipResult() => Rng.Value.Next(0, 2) == 1;
+        public int FlipResult(int min, int max) => (min >= max) ? min : Rng.Value.Next(min, max);
+
+        private class WinResult
+        {
+            public string Category { get; set; }
+            public int Line { get; set; }
+            public char Symbol { get; set; }
+            public int Count { get; set; }
+            public double Amount { get; set; }
+        }
+
+        // Centralized win calculation. Produces a list of WinResult entries and then
+        // applies payouts and UI feedback in a single, easy-to-follow pass.
+        // When promptForFreeSpins is true the player will be asked whether they want
+        // to start the awarded free spins immediately after payouts are applied.
+        public void CalculateWins(SlotReels slot, double betAmount, bool promptForFreeSpins = true, int multiplier = 1)
+        {
+            if (slot.Length == 0) return;
+
+            // Detect scatter hits but defer awarding until after payouts are applied
+            int scatterCount = slot.Reels.SelectMany(r => r.Items).Count(i => i.Type == 'S');
+            int pendingFreeSpins = scatterCount >= 3 ? 10 : 0;
+
+            const int rows = 3;
+            const int cols = 5;
+
+            var wins = new List<WinResult>();
+
+            // Horizontal wins (per row)
+            var horizontalPattern = new Regex("(.)\\1{2,}");
+            for (int r = 0; r < slot.Length; r++)
+            {
+                var reel = slot.Reels[r];
+                var line = string.Concat(reel.Items.Select(i => i.Type));
+                var match = horizontalPattern.Match(line);
                 if (match.Success)
                 {
-                    result[line] = verticalRow[0];
+                    char sym = match.Value[0];
+                    int timesRepeated = line.Count(x => x == sym);
+                    double amount = ComputeHorizontalPayout(sym, timesRepeated, betAmount);
+                    wins.Add(new WinResult { Category = "HORIZONTAL", Line = r + 1, Symbol = sym, Count = timesRepeated, Amount = amount });
                 }
-                
             }
-            return result;
-        }
-        #endregion
-        #region Misc
-        public string AsString(SlotReel reel) {
-            string final = "";
-            for (int i = 0; i < reel.items.Length; i++) { 
-                SlotItem currentItem = reel.items[i];
-                final += currentItem.type;
-            }
-            return final;
-        }
-        public void PrintSlotSpin(SlotReels slot) {
-            for (int i = 0; i < slot.Reels.Length; i++) {
-                Console.WriteLine();
-                Console.WriteLine();
-                Console.Write(new string(' ', 45));
-                for (int j = 0; j < slot.Reels[i].items.Length; j++) {
-                    SlotItem slotItem = slot.Reels[i].items[j];
-                    Console.Write(slotItem.type + "  ");
-                }
-                Console.WriteLine();
-                Console.WriteLine();
-            }
-        }
-        #endregion
-        #endregion
-        #region Basic Animation
-        public void AnimateRoll(int seconds) {
-            Vector2 carretPos = new Vector2(0, 0);
-            int carretIndex = -1;
-            Program.Clear();
-            carretIndex = 0;
-            Program.PrintLine($"{new string(' ', 45)}{new string('*', 20)}");
-            carretPos.y += 1;
-            carretPos.x = 0;
-            Program.PrintLine($"{new string(' ', 45)}{new string('*', 1)}{new string(' ', 4)} ROLLING {new string(' ', 4)}*");
-            carretPos.y += 1;
-            carretPos.x = 0;
-            Program.PrintLine($"{new string(' ', 45)}{new string('*', 20)}");
-            carretPos.y += 1;
-            carretPos.x = 0;
-            int timesRepeated = seconds * 2;
-            Program.PrintLine($"");
-            carretPos.y += 1;
-            carretPos.x = 0;
-            Program.PrintLine($"");
-            carretPos.y += 1;
-            carretPos.x = 0;
-            Program.PrintLine($"");
-            carretPos.y += 1;
-            carretPos.x = 0;
-            Vector2 begin = carretPos;
-            Vector2 end = new Vector2(0, carretPos.y + 2);
-            
-            for (int i = 0; i < timesRepeated; i++) {
 
-                MediaPlayer mp = new MediaPlayer();
-                mp.Open(new Uri(Directory.GetCurrentDirectory() + @"\sounds\roll.wav"));
+            // Diagonal wins (top-left -> bottom-right) across columns. We evaluate all diagonals
+            // that span exactly `rows` symbols (i.e., start columns 0..cols-rows).
+            for (int startCol = 0; startCol <= cols - rows; startCol++)
+            {
+                var diagChars = new List<char>();
+                for (int r = 0; r < rows; r++)
+                {
+                    int c = startCol + r;
+                    if (c < slot.Reels[r].Length)
+                        diagChars.Add(slot.Reels[r].Items[c].Type);
+                }
+
+                var diag = string.Concat(diagChars);
+                var match = horizontalPattern.Match(diag);
+                if (match.Success)
+                {
+                    char sym = match.Value[0];
+                    int times = diag.Count(x => x == sym);
+                    double amount = (WinningTable.ContainsKey(sym) ? WinningTable[sym] : 0) * (betAmount / 5) * times * 11;
+                    wins.Add(new WinResult { Category = "DIAGONAL", Line = startCol + 1, Symbol = sym, Count = times, Amount = amount });
+                }
+            }
+
+            // Vertical wins (per column) - we expect rows tall sequences
+            for (int c = 0; c < cols; c++)
+            {
+                var colChars = new List<char>();
+                for (int r = 0; r < slot.Length; r++)
+                {
+                    if (c < slot.Reels[r].Length)
+                        colChars.Add(slot.Reels[r].Items[c].Type);
+                }
+
+                var col = string.Concat(colChars);
+                var match = horizontalPattern.Match(col);
+                if (match.Success)
+                {
+                    char sym = match.Value[0];
+                    double amount = (WinningTable.ContainsKey(sym) ? WinningTable[sym] : 0) * (betAmount / 5) * rows * 20;
+                    wins.Add(new WinResult { Category = "VERTICAL", Line = c + 1, Symbol = sym, Count = rows, Amount = amount });
+                }
+            }
+
+            // No wins case
+            if (wins.Count == 0)
+            {
+                Program.PrintLine("No winnings, Try Again.");
+                _player.Add(-betAmount);
+                Program.PrintLine(_player.ToString());
+
+                // If there were pending free spins (from scatters) still award them but do not prompt
+                if (pendingFreeSpins > 0)
+                    AwardFreeSpins(pendingFreeSpins);
+
+                return;
+            }
+
+            // Payouts and presentation
+            Program.PrintLine("");
+            Program.PrintLine(new string(' ', 49) + new string('*', 20));
+            Program.PrintLine(new string(' ', 53) + "W I N N E R   ");
+            Program.PrintLine(new string(' ', 49) + new string('*', 20));
+            Program.PrintLine("");
+
+            var winsTotal = 0.0;
+            foreach (var w in wins)
+            {
+                // Apply free-spin multiplier only when > 1. Multiplier provided by caller (free spins)
+                double appliedAmount = w.Amount * Math.Max(1, multiplier);
+                winsTotal += appliedAmount;
+                string symbolDescription = w.Symbol == 'W' ? "special triggered bonus from WILD symbol" : w.Symbol.ToString();
+                if (w.Category == "HORIZONTAL")
+                    Program.PrintLine($"Won ${appliedAmount} at line {w.Line} by symbol {symbolDescription} repeated {w.Count} times");
+                else if (w.Category == "DIAGONAL")
+                    Program.PrintLine($"Won ${appliedAmount} on diagonal starting at column {w.Line} by symbol {symbolDescription} repeated {w.Count} times");
+                else
+                    Program.PrintLine($"Won ${appliedAmount} at vertical line {w.Line} by symbol {symbolDescription} repeated {w.Count} times");
+
+                _player.Add(appliedAmount);
+            }
+
+            Program.PrintLine($"Total win is ${winsTotal} with a bet amount of ${betAmount}");
+
+            // Play a sound for big wins; keep player experience code isolated and simple
+            try
+            {
+                var mp = new MediaPlayer();
+                if (winsTotal > 500)
+                {
+                    mp.Open(new Uri(Path.Combine(Directory.GetCurrentDirectory(), "sounds", "bigwin.wav")));
+                    mp.Volume = 0.6;
+                }
+                else
+                {
+                    mp.Open(new Uri(Path.Combine(Directory.GetCurrentDirectory(), "sounds", "win.wav")));
+                    mp.Volume = 0.4;
+                }
+
                 mp.Play();
-                for (int j = 0; j < 3; j++) {
-                    Console.SetCursorPosition(begin.x, begin.y + j * 2);
-                    Program.PrintInline($"{new string(' ', 42)}");
-                    for (int k = 0; k < 5; k++) {
-                        Program.PrintInline($"{GetRandomChar()}     ");
+                Thread.Sleep(2000);
+                mp.Stop();
+            }
+            catch
+            {
+                // Non-critical: if audio fails just continue
+            }
+
+            // After payouts, if scatter trigger occurred, award free spins and optionally prompt
+            if (pendingFreeSpins > 0)
+            {
+                AwardFreeSpins(pendingFreeSpins);
+
+                if (promptForFreeSpins)
+                {
+                    Program.PrintLine("You have been awarded free spins. Would you like to start the Free Spins bonus now? (Y/N)");
+                    var response = Console.ReadLine();
+                    if (!string.IsNullOrEmpty(response) && (response.Equals("Y", StringComparison.OrdinalIgnoreCase) || response.Equals("Yes", StringComparison.OrdinalIgnoreCase)))
+                    {
+                        PlayFreeSpins(pendingFreeSpins, betAmount);
+                    }
+                    else
+                    {
+                        Program.PrintLine("Free Spins saved. You can start them later.");
+                    }
+                }
+            }
+        }
+
+        // Convert a reel to a string representation
+        public string AsString(SlotReel reel)
+        {
+            return string.Concat(reel.Items.Select(i => i.Type));
+        }
+
+        // Nicely print the current spin in row-major layout
+        public void PrintSlotSpin(SlotReels slot)
+        {
+            // We print rows; columns are aligned starting at column 45 with 3 chars per column
+            const int leftPad = 45;
+            const int colWidth = 3; // e.g. 'A' + two spaces
+            int rows = slot.Length;
+            int cols = slot.Reels.Count > 0 ? slot.Reels[0].Length : 0;
+
+            for (int r = 0; r < rows; r++)
+            {
+                Console.WriteLine();
+                Console.WriteLine();
+                Console.Write(new string(' ', leftPad));
+                for (int c = 0; c < cols; c++)
+                {
+                    Console.Write(slot.Reels[r].Items[c].Type + "  ");
+                }
+                Console.WriteLine();
+                Console.WriteLine();
+            }
+
+            // If in free-spin mode and we have a column with an active multiplier, show it beneath the board
+            if (IsInFreeSpinMode && MultiplierColumnIndex >= 0 && cols > MultiplierColumnIndex)
+            {
+                // Move to next line and print indicator aligned to column
+                Console.WriteLine();
+                int indicatorLeft = leftPad + MultiplierColumnIndex * colWidth + 1; // center under the column
+                try
+                {
+                    if (indicatorLeft >= 0)
+                    {
+                        Console.SetCursorPosition(indicatorLeft, Console.CursorTop - 1);
+                        Console.Write($"x{FreeSpinMultiplier}");
+                    }
+                }
+                catch
+                {
+                    // ignore if console size doesn't allow positioning
+                }
+                Console.WriteLine();
+            }
+        }
+
+        // Basic animation for the console. Kept lightweight to avoid blocking too long.
+        public void AnimateRoll(int seconds)
+        {
+            var carretPosY = 0;
+            Program.Clear();
+            Program.PrintLine($"{new string(' ', 45)}{new string('*', 20)}");
+            Program.PrintLine($"{new string(' ', 45)}{new string('*', 1)}{new string(' ', 4)} ROLLING {new string(' ', 4)}*");
+            Program.PrintLine($"{new string(' ', 45)}{new string('*', 20)}");
+
+            int timesRepeated = Math.Max(1, seconds) * 2;
+
+            for (int i = 0; i < timesRepeated; i++)
+            {
+                try
+                {
+                    var mp = new MediaPlayer();
+                    mp.Open(new Uri(Path.Combine(Directory.GetCurrentDirectory(), "sounds", "roll.wav")));
+                    mp.Play();
+                }
+                catch { }
+
+                for (int row = 0; row < 3; row++)
+                {
+                    Console.SetCursorPosition(0, 6 + row * 2);
+                    Console.Write(new string(' ', 42));
+                    for (int k = 0; k < 5; k++)
+                    {
+                        Console.Write(GetRandomChar() + "     ");
                         Thread.Sleep(20);
                     }
-                    Program.PrintLine("");
-                    Program.PrintLine("");
+                    Console.WriteLine();
+                    Console.WriteLine();
                 }
             }
         }
-        private char GetRandomChar() {
-            char result = '0';
-            string valid = "AK345W";
-            result = valid[new Random().Next(0, valid.Length - 1)];
-            return result;
+
+        private char GetRandomChar()
+        {
+            const string valid = "AK345W";
+            return valid[Rng.Value.Next(0, valid.Length)];
         }
-        private string GetRandomLine(int lenght) {
-            string valid = "abcdef0123456789";
-            int c = 0;
-            string result = "";
-            while (c < lenght) {
-                result += valid[new Random().Next(0, valid.Length - 1)];
-                c++;
-            }
-            return result;
+
+        private string GetRandomLine(int length)
+        {
+            const string valid = "abcdef0123456789";
+            var sb = new System.Text.StringBuilder(length);
+            for (int i = 0; i < length; i++) sb.Append(valid[Rng.Value.Next(0, valid.Length)]);
+            return sb.ToString();
         }
-        #endregion
+
+        // Compute horizontal payout based on original payout rules with defensive checks.
+        // Rules derived from previous implementation:
+        // - 3 in a row: baseMultiplier = WinningTable[sym] * (betAmount / 5)
+        // - 4 in a row: base * timesRepeated
+        // - 5 in a row: base * timesRepeated * 10
+        private double ComputeHorizontalPayout(char sym, int timesRepeated, double betAmount)
+        {
+            if (timesRepeated < 3) return 0.0;
+            if (!WinningTable.ContainsKey(sym)) return 0.0;
+
+            double baseValue = WinningTable[sym] * (betAmount / 5.0);
+
+            return timesRepeated switch
+            {
+                3 => baseValue,
+                4 => baseValue * timesRepeated,
+                5 => baseValue * timesRepeated * 10,
+                _ => baseValue * timesRepeated
+            };
+        }
     }
 }
