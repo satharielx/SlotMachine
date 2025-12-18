@@ -38,7 +38,7 @@ namespace slot
             lock (sync)
             {
                 SetTrueBalance(0.0);
-                Anticheat.Log($"[PUNISHMENT APPLIED] Balance reset to 0.0 by integrity failure.");
+                //Anticheat.Log($"[PUNISHMENT APPLIED] Balance reset to 0.0 by integrity failure.");
             }
         }
 
@@ -57,7 +57,7 @@ namespace slot
 
             if (decryptedLong + currentKey != decryptedGuard)
             {
-                Anticheat.Log("[CRITICAL TAMPER] SSOT integrity check failed! Protected memory was changed externally.");
+                //Anticheat.Log("[CRITICAL TAMPER] SSOT integrity check failed! Protected memory was changed externally.");
                 ApplyPunishment();
                 return 0.0;
             }

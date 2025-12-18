@@ -1,189 +1,295 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading;
-using System.Security.Principal;
 
 namespace slot
 {
-    public static class Anticheat
+    internal static class Anticheat
     {
-        // Synchronize access to log file to avoid interleaved writes from multiple threads
-        private static readonly object LogLock = new object();
-        private static string LogPath = "";
+        private static Thread _scanThread;
+        private static volatile bool _running;
+        private static int _myPid;
 
-        // VEH and debugging detection use native Win32 APIs via P/Invoke
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr AddVectoredExceptionHandler(uint First, IntPtr Handler);
+        // Simple blacklist by process name (exe filenames)
+        private static readonly HashSet<string> BlacklistedProcesses =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "cheatengine.exe",
+                "cheatengine-x86_64.exe",
+                "x64dbg.exe",
+                "ollydbg.exe",
+                "ida.exe",
+                "scylla_x64.exe",
+                "scylla_x86.exe"
+            };
+
+        // Handle scanner settings
+        private const int SystemHandleInformation = 16;
+        private const uint STATUS_INFO_LENGTH_MISMATCH = 0xC0000004;
+        private const uint STATUS_SUCCESS = 0x00000000;
+
+        // Access flags of interest
+        private const uint PROCESS_VM_READ = 0x0010;
+        private const uint PROCESS_VM_WRITE = 0x0020;
+        private const uint PROCESS_VM_OPERATION = 0x0008;
+        private const uint PROCESS_ALL_ACCESS = 0x001F0FFF;
+
+        private const uint PROCESS_QUERY_INFO = 0x0400;
+        private const uint PROCESS_DUP_HANDLE = 0x0040;
+
+        private const uint DUPLICATE_SAME_ACCESS = 0x00000002;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SYSTEM_HANDLE_INFORMATION
+        {
+            public int ProcessId;
+            public byte ObjectTypeNumber;
+            public byte Flags;
+            public ushort Handle;
+            public IntPtr Object;
+            public uint GrantedAccess;
+        }
+
+        [DllImport("ntdll.dll")]
+        private static extern uint NtQuerySystemInformation(
+            int systemInformationClass,
+            IntPtr systemInformation,
+            int systemInformationLength,
+            out int returnLength);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool VirtualProtect(IntPtr lpAddress, uint dwSize, uint flNewProtect, out uint lpflOldProtect);
+        private static extern IntPtr OpenProcess(
+            uint desiredAccess,
+            bool inheritHandle,
+            int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DuplicateHandle(
+            IntPtr hSourceProcessHandle,
+            IntPtr hSourceHandle,
+            IntPtr hTargetProcessHandle,
+            out IntPtr lpTargetHandle,
+            uint dwDesiredAccess,
+            bool bInheritHandle,
+            uint dwOptions);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
 
         [DllImport("kernel32.dll")]
-        private static extern bool IsDebuggerPresent();
+        private static extern int GetProcessId(IntPtr hProcess);
 
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool CheckRemoteDebuggerPresent(IntPtr hProcess, out bool pbDebuggerPresent);
-
-        // Constants used by VEH and memory protection calls
-        private const uint EXCEPTION_ACCESS_VIOLATION = 0xC0000005;
-        private const int EXCEPTION_CONTINUE_SEARCH = 0;
-        private const int EXCEPTION_CONTINUE_EXECUTION = -1;
-        private const uint PAGE_READWRITE = 0x04;
-
-        // Minimal native structures required to inspect exception info coming from VEH
-        [StructLayout(LayoutKind.Sequential)]
-        private struct EXCEPTION_POINTERS
-        {
-            public IntPtr ExceptionRecord;
-            public IntPtr ContextRecord;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct EXCEPTION_RECORD
-        {
-            public uint ExceptionCode;
-            public uint ExceptionFlags;
-            public IntPtr ExceptionRecord;
-            public IntPtr ExceptionAddress;
-            public uint NumberParameters;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 15)]
-            public IntPtr[] ExceptionInformation;
-        }
-
-        // Delegate signature for the vectored exception handler
-        [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-        private delegate int VectoredExceptionHandler(IntPtr ExceptionInfo);
-        private static VectoredExceptionHandler _handlerDelegate;
-        private static volatile bool TrapTriggered = false;
-
-        // Initialize anticheat subsystems: logging, VEH registration and background workers.
-        // This method is intended to be idempotent and safe to call during startup.
         public static void Start()
         {
-            try
-            {
-                LogPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "SlotMachine", "anticheat.log");
-                Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
-            }
-            catch { LogPath = "anticheat.log"; }
+            _myPid = Process.GetCurrentProcess().Id;
 
-            Log($"[START] ANTICHEAT STARTED — {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
-
-            try
+            if (!Helpers.EnableDebugPrivilege())
             {
-                // Register a vectored exception handler. We keep a managed delegate reference
-                // to prevent the GC from collecting the native callback pointer.
-                _handlerDelegate = new VectoredExceptionHandler(ExceptionHandler);
-                AddVectoredExceptionHandler(1, Marshal.GetFunctionPointerForDelegate(_handlerDelegate));
-                Log("[OK] Memory access trap ARMED (VEH)");
-            }
-            catch (Exception ex)
-            {
-                // Don't let setup failure crash the app; log and continue in degraded mode.
-                Log($"[ERROR] Setup failed: {ex.Message}");
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine("[ANTICHEAT] Requires Administrator + SeDebugPrivilege. Exiting.");
+                Console.ResetColor();
+                Environment.Exit(-1);
             }
 
-            // Background thread that re-applies PAGE_NOACCESS shortly after an allowed R/W
-            new Thread(ReArmThread) { IsBackground = true }.Start();
+            if (_scanThread != null)
+                return;
 
-            // Background worker that periodically checks for attached debuggers
-            ThreadPool.QueueUserWorkItem(_ => DebuggerWatchdog());
+            _running = true;
+            _scanThread = new Thread(ScanLoop)
+            {
+                IsBackground = true,
+                Name = "AnticheatScanner"
+            };
+            _scanThread.Start();
+
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine($"[ANTICHEAT] Started (PID: {_myPid}) admin handle scanner.");
+            Console.ResetColor();
         }
 
-        // Vectored exception handler: unlocks our protected page when an access violation
-        // targets the page we manage. After unlocking we signal a short-lived window for
-        // the intended read/write to complete and then re-lock the page in the background.
-        private static int ExceptionHandler(IntPtr ExceptionInfoPtr)
+        public static void Stop()
         {
-            try
-            {
-                var pointers = Marshal.PtrToStructure<EXCEPTION_POINTERS>(ExceptionInfoPtr);
-                var record = Marshal.PtrToStructure<EXCEPTION_RECORD>(pointers.ExceptionRecord);
-
-                if (record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record.NumberParameters >= 2)
-                {
-                    int accessType = (int)record.ExceptionInformation[0];
-                    IntPtr faultAddr = record.ExceptionInformation[1];
-
-                    // If the fault address is within our protected region, temporarily make it writable
-                    if (PlayerBase.IsProtectedAddress(faultAddr))
-                    {
-                        VirtualProtect(PlayerBase.GetProtectedBase(), PlayerBase.GetProtectedSize(), PAGE_READWRITE, out _);
-
-                        string type = accessType == 0 ? "READ" : "WRITE";
-                        Log($"[VEH CAUGHT] Internal/External {type} → Protected SSOT @ 0x{faultAddr:X16}");
-
-                        // Signal the re-arm thread to restore protection after a brief delay
-                        TrapTriggered = true;
-
-                        // Ask the OS to retry the faulting instruction now that memory is writable
-                        return EXCEPTION_CONTINUE_EXECUTION;
-                    }
-                }
-            }
-            catch
-            {
-                // If anything unexpected happens while handling the exception, allow normal
-                // exception dispatching to continue so the process behavior remains predictable.
-                return EXCEPTION_CONTINUE_SEARCH;
-            }
-
-            return EXCEPTION_CONTINUE_SEARCH;
+            _running = false;
         }
 
-        // Background thread that restores PAGE_NOACCESS after a short window where memory
-        // was intentionally made writable. This reduces the attack surface (short window).
-        private static void ReArmThread()
+        private static void ScanLoop()
         {
-            while (true)
-            {
-                if (TrapTriggered)
-                {
-                    Thread.Sleep(5);
-                    TrapTriggered = false;
-                    PlayerBase.ReArmTrap();
-                }
-                Thread.Sleep(10);
-            }
-        }
-
-        // Periodically checks for local and remote debuggers and logs detections.
-        // This is a best-effort detector and intentionally noisy for visibility during development.
-        private static void DebuggerWatchdog()
-        {
-            while (true)
+            while (_running)
             {
                 try
                 {
-                    if (IsDebuggerPresent() || Debugger.IsAttached)
-                        Log("[DETECTED] Debugger attached");
-                    if (CheckRemoteDebuggerPresent(Process.GetCurrentProcess().Handle, out bool dbg) && dbg)
-                        Log("[DETECTED] Remote debugger");
-                    Thread.Sleep(1000);
+                    ScanBlacklistedProcesses();
+                    ScanSystemHandles();
                 }
-                catch { Thread.Sleep(1000); }
+                catch (Exception ex)
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("[ANTICHEAT] Scan error: " + ex.Message);
+                    Console.ResetColor();
+                }
+
+                Thread.Sleep(2000);
             }
         }
 
-        // Thread-safe logging helper. We deliberately swallow all exceptions to avoid
-        // interfering with the host application's control flow in production environments.
-        public static void Log(string msg)
+        // --- Layer 1: simple process blacklist --------------------------------
+
+        private static void ScanBlacklistedProcesses()
         {
+            foreach (var proc in Process.GetProcesses())
+            {
+                try
+                {
+                    var name = proc.ProcessName + ".exe"; // ProcessName has no .exe
+                    if (BlacklistedProcesses.Contains(name) && proc.Id != _myPid)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine($"[ANTICHEAT] Blacklisted process detected: {name} (PID {proc.Id}).");
+                        Console.ResetColor();
+                        PlayerBase.ApplyPunishment();
+                    }
+                }
+                catch
+                {
+                    // ignore access denied processes
+                }
+            }
+        }
+
+        // --- Layer 2: handle scanner ------------------------------------------
+
+        private enum HandleCheckResult
+        {
+            NotOurs,
+            IsOurs,
+            CannotOpenProcess,
+            CannotDuplicate,
+            GetPidFailed
+        }
+
+        private static void ScanSystemHandles()
+        {
+            int length = 0x10000;
+            IntPtr buffer = Marshal.AllocHGlobal(length);
+            int returnLength;
+            uint status;
+
             try
             {
-                string line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {msg}";
-                lock (LogLock)
+                while ((status = NtQuerySystemInformation(
+                    SystemHandleInformation,
+                    buffer,
+                    length,
+                    out returnLength)) == STATUS_INFO_LENGTH_MISMATCH)
                 {
-                    File.AppendAllText(LogPath, line + Environment.NewLine);
+                    Marshal.FreeHGlobal(buffer);
+                    length = returnLength;
+                    buffer = Marshal.AllocHGlobal(length);
                 }
-                Console.WriteLine(line);
+
+                if (status != STATUS_SUCCESS)
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"[ANTICHEAT] NtQuerySystemInformation failed: 0x{status:X8}");
+                    Console.ResetColor();
+                    return;
+                }
+
+                int handleCount = Marshal.ReadInt32(buffer);   // 4-byte count
+                IntPtr currentPtr = buffer + 4;
+                int entrySize = Marshal.SizeOf(typeof(SYSTEM_HANDLE_INFORMATION));
+
+                for (int i = 0; i < handleCount; i++)
+                {
+                    var handleInfo =
+                        Marshal.PtrToStructure<SYSTEM_HANDLE_INFORMATION>(currentPtr);
+                    currentPtr += entrySize;
+
+                    int ownerPid = handleInfo.ProcessId;
+                    if (ownerPid == _myPid || ownerPid <= 4)
+                        continue;
+
+                    uint access = handleInfo.GrantedAccess;
+                    bool hasRead = (access & PROCESS_VM_READ) != 0;
+                    bool hasWrite = (access & PROCESS_VM_WRITE) != 0;
+                    bool hasOp = (access & PROCESS_VM_OPERATION) != 0;
+                    bool hasAll = (access & PROCESS_ALL_ACCESS) == PROCESS_ALL_ACCESS;
+
+                    if (!hasRead && !hasWrite && !hasOp && !hasAll)
+                        continue;
+
+                    var res = IsHandlePointingToUs(ownerPid, handleInfo.Handle);
+                    string name = GetProcessNameSafe(ownerPid);
+
+                    if (res == HandleCheckResult.IsOurs)
+                    {
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.WriteLine();
+                        Console.WriteLine("[ANTICHEAT] External memory handle detected!");
+                        Console.WriteLine($"  Source: {name} (PID {ownerPid})");
+                        Console.WriteLine($"  Handle: 0x{handleInfo.Handle:X}");
+                        Console.WriteLine($"  Access: 0x{access:X8} (READ={hasRead}, WRITE={hasWrite}, OP={hasOp}, ALL={hasAll})");
+                        Console.ResetColor();
+
+                        PlayerBase.ApplyPunishment();
+                        return;
+                    }
+                }
             }
-            catch { }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static HandleCheckResult IsHandlePointingToUs(int ownerPid, ushort handleValue)
+        {
+            IntPtr hOwner = IntPtr.Zero;
+            IntPtr hDup = IntPtr.Zero;
+
+            try
+            {
+                hOwner = OpenProcess(
+                    PROCESS_QUERY_INFO | PROCESS_DUP_HANDLE,
+                    false,
+                    ownerPid);
+
+                if (hOwner == IntPtr.Zero)
+                    return HandleCheckResult.CannotOpenProcess;
+
+                if (!DuplicateHandle(
+                        hOwner,
+                        new IntPtr(handleValue),
+                        Process.GetCurrentProcess().Handle,
+                        out hDup,
+                        0,
+                        false,
+                        DUPLICATE_SAME_ACCESS))
+                {
+                    return HandleCheckResult.CannotDuplicate;
+                }
+
+                int targetPid = GetProcessId(hDup);
+                if (targetPid == 0)
+                    return HandleCheckResult.GetPidFailed;
+
+                return targetPid == _myPid
+                    ? HandleCheckResult.IsOurs
+                    : HandleCheckResult.NotOurs;
+            }
+            finally
+            {
+                if (hDup != IntPtr.Zero) CloseHandle(hDup);
+                if (hOwner != IntPtr.Zero) CloseHandle(hOwner);
+            }
+        }
+
+        private static string GetProcessNameSafe(int pid)
+        {
+            try { return Process.GetProcessById(pid).ProcessName; }
+            catch { return "unknown"; }
         }
     }
 }
