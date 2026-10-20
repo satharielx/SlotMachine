@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -14,7 +14,7 @@ namespace slot
             Console.OutputEncoding = new UTF8Encoding(false);
             Console.Title = "Aurum | Fifteen Lines";
             var player = new PlayerBase();
-            var game = new SlotMachine(player);
+            using var game = new SlotMachine(player);
             var music = new MediaPlayer();
             try
             {

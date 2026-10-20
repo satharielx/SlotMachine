@@ -1,7 +1,8 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Threading;
 
 namespace slot
@@ -27,11 +28,12 @@ namespace slot
         public int Length => Reels.Count;
     }
 
-    public class SlotMachine
+    public class SlotMachine : IDisposable
     {
         private readonly PlayerBase _player;
-        private readonly Random _random = new Random();
-        private readonly double[] _betOptions = { 1.50, 3.00, 7.50, 15.00, 30.00, 75.00, 150.00 };
+        private readonly Random _visualRandom = new Random();
+        private readonly IRandomSource _outcomeRandom;
+        private readonly GameEngine _engine;
         private readonly int[] _reelStops = { 8, 14, 20, 26, 32 };
         private SlotReels _preGeneratedResult;
         private SlotReels _animationSymbols;
@@ -42,98 +44,94 @@ namespace slot
         private int _anticheatPage;
         private int _spins;
         private int _view;
-        private bool _isFreeSpin;
         private bool _highlight;
-        private bool _choosingBonus;
         private bool _quitRequested;
-        private double _lastWin;
+        private decimal _lastWin;
+        private RoundStep _step;
+        private bool _featurePaused;
+        private int _rulesPage;
         private string _message = "Press SPACE to spin.";
 
-        public int FreeSpinsLeft { get; private set; }
-        public double CurrentBet => _betOptions[_betIndex];
+        public int FreeSpinsLeft => _engine.FreeSpinsLeft;
+        public double CurrentBet => (double)(_engine.Mode == GameMode.BaseGame ? SlotRules.BetOptions[_betIndex] : _engine.FeatureBet);
 
-        public SlotMachine(PlayerBase player)
+        public SlotMachine(PlayerBase player) : this(player, new CryptoRandomSource()) { }
+
+        internal SlotMachine(PlayerBase player, IRandomSource random)
         {
             _player = player ?? throw new ArgumentNullException(nameof(player));
-            _preGeneratedResult = GenerateSpin();
+            _outcomeRandom = random ?? throw new ArgumentNullException(nameof(random));
+            _engine = new GameEngine(new PlayerWallet(player), random);
+            _preGeneratedResult = GenerateVisualBoard();
         }
 
-        public SlotReels GenerateSpin()
+        public void Dispose() => (_outcomeRandom as IDisposable)?.Dispose();
+
+        private SlotReels GenerateVisualBoard(bool coins = false)
         {
-            var result = new SlotReels();
+            var symbols = new char[3, 5];
+            string choices = coins ? "O...." : "345AKCWSO";
             for (int row = 0; row < 3; row++)
-            {
-                var reel = new SlotReel();
-                for (int column = 0; column < 5; column++)
-                {
-                    double chance = _random.NextDouble();
-                    char symbol = chance < 0.04 ? 'W' : chance < 0.07 ? 'S' : "AK345"[_random.Next(5)];
-                    reel.Add(new SlotItem { Index = column, Type = symbol });
-                }
-                result.Add(reel);
-            }
-            return result;
+                for (int column = 0; column < 5; column++) symbols[row, column] = choices[_visualRandom.Next(choices.Length)];
+            return SlotRules.Board(symbols);
         }
 
-        public void AnimateRoll()
+        private void AnimateRoll(RoundStep step)
         {
-            _preGeneratedResult = GenerateSpin();
+            _preGeneratedResult = step.Board;
             _winningPaths.Clear();
-            _message = _isFreeSpin ? "Free spin. Wins pay triple." : "Spinning...";
-            for (int frame = 0; frame < 35; frame++)
+            _message = step.CoinRespin ? "Looking for more coins..." : step.FreeSpin ? $"Free spin at {step.Multiplier}x." : "Spinning...";
+            try
             {
-                _animationFrame = frame;
-                _animationSymbols = GenerateSpin();
-                DrawUIFrame();
-                Thread.Sleep(30);
+                for (int frame = 0; frame < 35; frame++)
+                {
+                    _animationFrame = frame;
+                    _animationSymbols = GenerateVisualBoard(step.CoinRespin);
+                    DrawUIFrame();
+                    if (Console.KeyAvailable)
+                    {
+                        var key = Console.ReadKey(true).Key;
+                        if (key == ConsoleKey.Q || key == ConsoleKey.Escape) { _quitRequested = true; break; }
+                        HandleNavigation(key);
+                    }
+                    Thread.Sleep(30);
+                }
             }
-            _animationFrame = -1;
-            DrawUIFrame();
+            finally { _animationFrame = -1; }
         }
 
-        public void CalculateWins()
+        private void PlayStep(bool feature)
         {
-            var result = SlotRules.Evaluate(_preGeneratedResult, CurrentBet, _isFreeSpin);
-            _lastWin = result.Win;
-            _winningPaths = result.WinningPaths;
-            if (result.Win > 0)
+            RoundStep step;
+            try
             {
-                _player.Add(result.Win);
-                _message = $"You won ${result.Win:N2} on {result.WinningPaths.Count} {(result.WinningPaths.Count == 1 ? "line" : "lines")}.";
-                for (int flash = 0; flash < 4; flash++)
-                {
-                    _highlight = flash % 2 == 0;
-                    Wait(160);
-                }
+                step = feature ? _engine.BeginFeatureStep() : _engine.BeginPaidSpin(SlotRules.BetOptions[_betIndex]);
+            }
+            catch (CryptographicException)
+            {
+                _featurePaused = feature;
+                _message = feature ? "Random source unavailable. SPACE retries the bonus." : "Random source unavailable. Your bet was refunded.";
+                return;
+            }
+            if (step == null) { _message = "Not enough credits. Press C to add $500."; return; }
+            _step = step;
+            _featurePaused = false;
+            _highlight = false;
+            if (!step.CoinRespin) { _spins++; _lastWin = 0; }
+            try { AnimateRoll(step); }
+            finally { _engine.CompleteStep(step.Id); }
+            _lastWin += step.Payout;
+            _winningPaths = step.Lines?.WinningPaths ?? new List<int[]>();
+            if (step.CoinFinished) _message = $"Coin bonus paid ${step.CoinPayout:N2}!";
+            else if (step.CoinStarted || step.CoinRespin) _message = $"${step.CoinTotal:N2} locked. {step.Respins} respins left.";
+            else if (step.FreeSpinsAdded > 0) _message = $"{step.FreeSpinsAdded} free spins added! Line win: ${step.Payout:N2}.";
+            else _message = step.Payout > 0 ? $"You won ${step.Payout:N2}." : "No win this time.";
+            if (step.Payout > 0)
+            {
+                for (int flash = 0; flash < 4; flash++) { _highlight = flash % 2 == 0; Wait(140); }
                 _highlight = true;
             }
-            else _message = "No win this time.";
-            if (result.Scatters >= 3) RunScatterBonus();
             DrawUIFrame();
-        }
-
-        private void RunScatterBonus()
-        {
-            _choosingBonus = true;
-            _view = 0;
-            _message = "Pick a treasure: 1, 2 or 3.";
-            int[] treasures = { _random.Next(5, 15), _random.Next(5, 15), _random.Next(5, 15) };
-            int choice = 0;
-            while (!_quitRequested)
-            {
-                var key = ReadGameKey();
-                if (key == ConsoleKey.D1 || key == ConsoleKey.NumPad1) break;
-                if (key == ConsoleKey.D2 || key == ConsoleKey.NumPad2) { choice = 1; break; }
-                if (key == ConsoleKey.D3 || key == ConsoleKey.NumPad3) { choice = 2; break; }
-                if (key == ConsoleKey.Q || key == ConsoleKey.Escape) _quitRequested = true;
-            }
-            double bonus = CurrentBet * treasures[choice];
-            _player.Add(bonus);
-            _lastWin += bonus;
-            FreeSpinsLeft += 15;
-            _choosingBonus = false;
-            _message = $"You found ${bonus:N2} and 15 free spins!";
-            Wait(1200);
         }
 
         public void RunGameLoop()
@@ -151,28 +149,21 @@ namespace slot
                 while (!_quitRequested)
                 {
                     DrawUIFrame();
-                    if (FreeSpinsLeft > 0)
+                    if (_engine.Mode != GameMode.BaseGame && !_featurePaused)
                     {
                         Wait(650);
                         if (_quitRequested) break;
-                        FreeSpinsLeft--;
-                        _isFreeSpin = true;
-                        try { Spin(); }
-                        finally { _isFreeSpin = false; }
+                        PlayStep(true);
                         continue;
                     }
                     var key = ReadGameKey();
-                    if (key == ConsoleKey.Spacebar)
+                    if (key == ConsoleKey.Spacebar) PlayStep(_engine.Mode != GameMode.BaseGame);
+                    else if (_engine.Mode == GameMode.BaseGame && key == ConsoleKey.UpArrow) _betIndex = Math.Min(_betIndex + 1, SlotRules.BetOptions.Length - 1);
+                    else if (_engine.Mode == GameMode.BaseGame && key == ConsoleKey.DownArrow) _betIndex = Math.Max(_betIndex - 1, 0);
+                    else if (_engine.Mode == GameMode.BaseGame && key == ConsoleKey.F)
                     {
-                        if (_player.TrySpend(CurrentBet)) Spin();
-                        else _message = "Not enough credits. Press C to add $500.";
-                    }
-                    else if (key == ConsoleKey.UpArrow) _betIndex = Math.Min(_betIndex + 1, _betOptions.Length - 1);
-                    else if (key == ConsoleKey.DownArrow) _betIndex = Math.Max(_betIndex - 1, 0);
-                    else if (key == ConsoleKey.F)
-                    {
-                        if (_player.TrySpend(CurrentBet * 50)) { FreeSpinsLeft += 15; _message = "15 free spins ready. Wins pay triple."; }
-                        else _message = $"You need ${CurrentBet * 50:N2} for the bonus. C adds credits.";
+                        if (_engine.BuyFreeSpins(SlotRules.BetOptions[_betIndex])) _message = "15 free spins ready. Wilds stick and grow the multiplier.";
+                        else _message = $"You need ${CurrentBet * SlotRules.BonusBuyMultiplier:N2} for the bonus. C adds credits.";
                     }
                     else if (key == ConsoleKey.Q || key == ConsoleKey.Escape) _quitRequested = true;
                 }
@@ -186,21 +177,12 @@ namespace slot
             }
         }
 
-        private void Spin()
-        {
-            _spins++;
-            _lastWin = 0;
-            _highlight = false;
-            AnimateRoll();
-            CalculateWins();
-        }
-
         private bool HandleNavigation(ConsoleKey key)
         {
             if (key == ConsoleKey.Tab) _view = _view == 1 ? 0 : 1;
             else if (key == ConsoleKey.H) _view = _view == 2 ? 0 : 2;
-            else if (key == ConsoleKey.PageDown) _anticheatPage++;
-            else if (key == ConsoleKey.PageUp) _anticheatPage = Math.Max(0, _anticheatPage - 1);
+            else if (key == ConsoleKey.PageDown) { if (_view == 2) _rulesPage = Math.Min(1, _rulesPage + 1); else _anticheatPage++; }
+            else if (key == ConsoleKey.PageUp) { if (_view == 2) _rulesPage = Math.Max(0, _rulesPage - 1); else _anticheatPage = Math.Max(0, _anticheatPage - 1); }
             else if (key == ConsoleKey.C || key == ConsoleKey.Z)
             {
                 _player.Add(500);
@@ -275,7 +257,7 @@ namespace slot
                 }
                 canvas.Write(2, height - 3, new string('─', width - 4), ConsoleColor.DarkGray);
                 canvas.Write(2, height - 2, ConsoleCanvas.Fit("SPACE Spin  ↑↓ Bet  C +$500  F Bonus  TAB Anti-cheat  H Help  Q Back", width - 4), ConsoleColor.Gray);
-                canvas.Write(2, height - 1, ConsoleCanvas.Fit(_view == 1 ? "PgUp / PgDn to see more. TAB returns to the game." : Anticheat.StatusText, width - 4), ConsoleColor.DarkGray);
+                canvas.Write(2, height - 1, ConsoleCanvas.Fit(_view == 1 ? "PgUp / PgDn to see more. TAB returns to the game." : _view == 2 ? "PgUp / PgDn switches between payouts and bonuses. H goes back." : Anticheat.StatusText, width - 4), ConsoleColor.DarkGray);
             }
             return canvas;
         }
@@ -288,29 +270,34 @@ namespace slot
             DrawMetric(canvas, x + (metricWidth + 1) * 2, y, width - (metricWidth + 1) * 2, "Last win", $"${_lastWin:N2}", ConsoleColor.Yellow);
             int reelY = y + 5;
             bool compact = canvas.Height < 27;
-            string mode = _animationFrame >= 0 ? "Spinning..." : _isFreeSpin || FreeSpinsLeft > 0 ? "Free spins - triple wins" : "15 paylines";
+            bool coinBoard = _step != null && (_step.CoinRespin || _step.CoinStarted);
+            string mode = coinBoard ? $"Coin bonus - {_step.Respins} respins" : _animationFrame >= 0 ? "Spinning..." : _engine.Mode == GameMode.FreeSpins ? $"Free spins - {_engine.Multiplier}x" : "15 paylines";
             canvas.Box(x, reelY - 1, width, compact ? 11 : 14, mode, ConsoleColor.DarkGray);
             int reelX = x + (width - 49) / 2;
             for (int row = 0; row < 3; row++)
             {
                 for (int column = 0; column < 5; column++)
                 {
-                    bool stopped = _animationFrame < 0 || _animationFrame > _reelStops[column];
+                    bool pinnedCoin = _step != null && _step.CoinRespin && _step.PreviousCoins[row, column] > 0;
+                    bool pinnedWild = _step != null && _step.FreeSpin && _step.PreviousSticky[row, column];
+                    bool stopped = pinnedCoin || pinnedWild || (_animationFrame < 0 || _animationFrame > _reelStops[column]);
                     char symbol = stopped ? _preGeneratedResult.Reels[row].Items[column].Type : _animationSymbols.Reels[row].Items[column].Type;
-                    bool winner = stopped && _highlight && _winningPaths.Any(path => path.Length > column && path[column] == row);
-                    ConsoleColor color = !stopped ? ConsoleColor.DarkGray : symbol == 'W' ? ConsoleColor.Yellow : symbol == 'S' ? ConsoleColor.Magenta : symbol == 'A' ? ConsoleColor.Cyan : symbol == 'K' ? ConsoleColor.White : ConsoleColor.Gray;
+                    bool winner = stopped && _highlight && (_winningPaths.Any(path => path.Length > column && path[column] == row) || (_step != null && _step.CoinFinished && _step.CoinValues[row, column] > 0));
+                    ConsoleColor color = !stopped ? ConsoleColor.DarkGray : symbol == 'W' ? ConsoleColor.Yellow : symbol == 'S' ? ConsoleColor.Magenta : symbol == 'C' || symbol == 'O' ? ConsoleColor.Yellow : symbol == 'A' ? ConsoleColor.Cyan : symbol == 'K' ? ConsoleColor.White : ConsoleColor.Gray;
                     ConsoleColor background = winner ? ConsoleColor.DarkGreen : ConsoleColor.Black;
                     int tileX = reelX + column * 10;
                     int tileY = reelY + row * (compact ? 3 : 4);
-                    canvas.Write(tileX, tileY, "╭───────╮", winner ? ConsoleColor.Green : ConsoleColor.DarkGray, background);
+                    bool sticky = stopped && _step != null && _step.FreeSpin && _step.Sticky[row, column];
+                    ConsoleColor border = winner ? ConsoleColor.Green : sticky ? ConsoleColor.Cyan : ConsoleColor.DarkGray;
+                    canvas.Write(tileX, tileY, "╭───────╮", border, background);
                     canvas.Write(tileX, tileY + 1, "│       │", color, background);
-                    canvas.Write(tileX + 4, tileY + 1, symbol.ToString(), color, background);
-                    canvas.Write(tileX, tileY + 2, "╰───────╯", winner ? ConsoleColor.Green : ConsoleColor.DarkGray, background);
+                    string label = symbol == 'O' && stopped && _step != null && _step.CoinValues[row, column] > 0 ? (_step.CoinValues[row, column] / _step.Bet).ToString("0") + "x" : symbol == '.' ? "·" : symbol.ToString();
+                    canvas.Center(tileX + 1, tileY + 1, 7, label, color, background);
+                    canvas.Write(tileX, tileY + 2, "╰───────╯", border, background);
                 }
             }
-            string message = _choosingBonus ? "Pick a treasure:  [1] Left   [2] Middle   [3] Right" : _message;
-            canvas.Center(x + 1, y + (compact ? 15 : 18), width - 2, message, _choosingBonus ? ConsoleColor.Magenta : _lastWin > 0 ? ConsoleColor.Green : ConsoleColor.Gray);
-            canvas.Write(x + 1, y + (compact ? 16 : 19), ConsoleCanvas.Fit($"Spins: {_spins}    Free spins: {FreeSpinsLeft}    Bonus: ${CurrentBet * 50:N2}", width - 2), ConsoleColor.DarkGray);
+            canvas.Center(x + 1, y + (compact ? 15 : 18), width - 2, _message, _lastWin > 0 ? ConsoleColor.Green : ConsoleColor.Gray);
+            canvas.Write(x + 1, y + (compact ? 16 : 19), ConsoleCanvas.Fit($"Spins: {_spins}  Free: {FreeSpinsLeft}  Next: {_engine.Multiplier}x  Bonus: ${CurrentBet * SlotRules.BonusBuyMultiplier:N2}", width - 2), ConsoleColor.DarkGray);
             if (height > 21) canvas.Write(x + 1, y + height - 1, ConsoleCanvas.Fit(Anticheat.StatusText, width - 2), ConsoleColor.DarkCyan);
         }
 
@@ -351,22 +338,35 @@ namespace slot
         {
             int width = canvas.Width - 4;
             canvas.Box(2, 3, width, canvas.Height - 7, "How to play", ConsoleColor.DarkCyan);
-            string[] rules = {
-                "Press SPACE to spin. Use the arrow keys to change your bet.",
-                "Match at least three symbols from left to right on a payline.",
-                "All 15 paylines are included in your bet.",
-                "W is wild: it fills in for any regular symbol.",
-                "A winning line with a wild and regular symbols pays double.",
-                "Land three or more S symbols to pick a treasure.",
-                "You'll win 5-14 times your bet, plus 15 free spins.",
-                "During free spins, line wins pay triple.",
-                "Press F to buy 15 free spins for 50 times your bet.",
-                "Running low? Press C to add $500 whenever you like."
+            string[] rules = _rulesPage == 0 ? new[] {
+                "Paytable                     3       4       5 symbols",
+                $"{"3, 4, 5",-24}{SlotRules.Payout('3', 3),3}x   {SlotRules.Payout('3', 4),4}x   {SlotRules.Payout('3', 5),4}x",
+                $"{"A, K",-24}{SlotRules.Payout('A', 3),3}x   {SlotRules.Payout('A', 4),4}x   {SlotRules.Payout('A', 5),4}x",
+                $"{"C (crown)",-24}{SlotRules.Payout('C', 3),3}x   {SlotRules.Payout('C', 4),4}x   {SlotRules.Payout('C', 5),4}x",
+                $"{"W (wilds only)",-24}{SlotRules.Payout('W', 3),3}x   {SlotRules.Payout('W', 4),4}x   {SlotRules.Payout('W', 5),4}x",
+                "",
+                "Payouts multiply your line bet: total bet / 15.",
+                "W substitutes. Only the best combination on each line pays.",
+                "S is a scatter. O is a coin. Neither pays on a line.",
+                "Free spins multiply line payouts. Coin prizes are separate.",
+                "PgDn: bonus rules. C adds $500. H returns to the game."
+            } : new[] {
+                "Scatters on 3 / 4 / 5 reels award 8 / 12 / 20 free spins.",
+                "Wilds stick for the feature. Cyan borders mark sticky wilds.",
+                "Start at 2x. New wilds raise the NEXT spin's multiplier.",
+                "Multiplier limit: 5x. Three scatter reels add five spins.",
+                "At most 50 free spins can be awarded per feature.",
+                "Free-spin reels have fewer new wilds; landed wilds stay.",
+                "Six coins trigger three respins. Existing coins stay put.",
+                "New coins reset the respin counter to three.",
+                "Three misses or a full board pays the collected coins once.",
+                "Coin labels are multiples of your locked bet (1x to 25x).",
+                "Coin bonuses run first; queued free spins resume afterward.",
+                $"F buys 15 free spins for {SlotRules.BonusBuyMultiplier}x your bet. PgUp: paytable."
             };
             for (int i = 0; i < rules.Length; i++)
                 canvas.Write(5, 5 + i, ConsoleCanvas.Fit(rules[i], width - 6), i % 2 == 0 ? ConsoleColor.White : ConsoleColor.Gray);
-            canvas.Write(5, 16, ConsoleCanvas.Fit("Line payout: matches x 1.5 x your bet / 15.", width - 6), ConsoleColor.DarkGray);
-            canvas.Write(5, 17, ConsoleCanvas.Fit("It's all play money. H takes you back.", width - 6), ConsoleColor.DarkCyan);
+            canvas.Write(5, 17, ConsoleCanvas.Fit($"Page {_rulesPage + 1}/2. RTP target: {SlotRules.TargetRtp:P1}. Play credits.", width - 6), ConsoleColor.DarkGray);
         }
     }
 }
