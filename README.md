@@ -1,6 +1,6 @@
 # Aurum
 
-A five-reel console slot machine with 15 paylines, animated spins, and an integrated anti-cheat panel. Written in C# by Sathariel. All wagers use play credits.
+A five-reel console slot machine with 15 paylines, animated spins, and an integrated anti-cheat panel. All wagers use play credits.
 
 ## Gameplay
 
